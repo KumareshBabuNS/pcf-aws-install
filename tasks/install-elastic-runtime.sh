@@ -2,7 +2,7 @@
 
 set -e -x
 
-stackName=$AWS_CLOUDFORMATION_STACK_NAME
+stackname=$AWS_CLOUDFORMATION_STACK_NAME
 opsmanDomain=$OPS_MANAGER_DOMAIN
 adminUser=$OPS_MANAGER_ADMIN_USER
 adminPass=$OPS_MANAGER_ADMIN_PASS
@@ -18,7 +18,7 @@ cfSmtpPassword=$CF_SMTP_PASSWORD
 cfS3Endpoint=$CF_S3_ENDPOINT
 
 # Get AWS Stack Outputs
-stack=$(aws cloudformation describe-stacks --stack-name $stackName)
+stack=$(aws cloudformation describe-stacks --stack-name $stackname)
 
 # asdf
 # Create CNAMEs
@@ -26,65 +26,63 @@ pcfElbDnsName=$(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey ==
 pcfElbSshDnsName=$(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElbSshDnsName") | .OutputValue')
 pcfElbTcpDnsName=$(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElbTcpDnsName") | .OutputValue')
 
-cat <<EOF >change-resource-record-sets.json
-{
-  "Comment": "create record sets for pcf",
-  "Changes": [
+jq -n \
+--arg appsDomain "*.$appsDomain" \
+--arg systemDomain "*.$systemDomain" \
+--arg sshDomain "ssh.$systemDomain" \
+--arg tcpDomain "tcp.$appsDomain" \
+--arg pcfElbDnsName "$pcfElbDnsName" \
+--arg pcfElbSshDnsName "$pcfElbSshDnsName" \
+--arg pcfElbTcpDnsName "$pcfElbTcpDnsName" \
+'{
+  Comment: "create record sets for pcf",
+  Changes: [
     {
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "*.$systemDomain",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [
-          {
-            "Value": "$pcfElbDnsName"
-          }
-        ]
+      Action: "CREATE",
+      ResourceRecordSet: {
+        Name: $appsDomain,
+        Type: "CNAME",
+        TTL: 300,
+        ResourceRecords: [{
+          Value: $pcfElbDnsName
+        }]
       }
     },
     {
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "*.$appsDomain",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [
-          {
-            "Value": "$pcfElbDnsName"
-          }
-        ]
+      Action: "CREATE",
+      ResourceRecordSet: {
+        Name: $systemDomain,
+        Type: "CNAME",
+        TTL: 300,
+        ResourceRecords: [{
+          Value: $pcfElbDnsName
+        }]
       }
     },
     {
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "ssh.$systemDomain",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [
-          {
-            "Value": "$pcfElbSshDnsName"
-          }
-        ]
+      Action: "CREATE",
+      ResourceRecordSet: {
+        Name: $sshDomain,
+        Type: "CNAME",
+        TTL: 300,
+        ResourceRecords: [{
+          Value: $pcfElbSshDnsName
+        }]
       }
     },
     {
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "tcp.$appsDomain",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [
-          {
-            "Value": "$pcfElbTcpDnsName"
-          }
-        ]
+      Action: "CREATE",
+      ResourceRecordSet: {
+        Name: $tcpDomain,
+        Type: "CNAME",
+        TTL: 300,
+        ResourceRecords: [{
+          Value: $pcfElbTcpDnsName
+        }]
       }
     }
   ]
-}
-EOF
+}' > change-resource-record-sets.json
 
 createRecordSet=$(aws route53 change-resource-record-sets --hosted-zone-id $hostedZoneId --change-batch file://change-resource-record-sets.json)
 
@@ -94,9 +92,7 @@ aws route53 wait resource-record-sets-changed --id $changeId
 
 # Login to UAA
 uaac target https://$opsmanDomain/uaa --skip-ssl-validation
-
 uaac token owner get opsman $adminUser -p $adminPass -s ''
-
 UAA_ACCESS_TOKEN=$(uaac context admin | grep access_token | awk '{ print $2 }')
 
 # Upload elastic-runtime
@@ -114,10 +110,12 @@ availableProducts=$(curl "https://$opsmanDomain/api/v0/available_products" -k \
 
 cfVersion=$(echo $availableProducts | jq -r '.[] | select(.name == "cf") | .product_version')
 
-stageData=$(jq -n "{
-  name: \"cf\",
-  product_version: $(echo $cfVersion | jq -R .)
-}")
+stageData=$(jq -n \
+--arg cfVersion $cfVersion \
+'{
+  name: "cf",
+  product_version: $cfVersion
+}')
 
 curl "https://$opsmanDomain/api/v0/staged/products" -k \
     -X POST \
@@ -133,72 +131,88 @@ stagedProducts=$(curl "https://$opsmanDomain/api/v0/staged/products" -k \
 cfGuid=$(echo $stagedProducts | jq -r '.[] | select(.type == "cf") | .guid')
 
 # Configure elastic-runtime
-properties=$(jq -n "{
+properties=$(jq -n \
+--arg systemDomain $systemDomain \
+--arg appsDomain $appsDomain \
+--arg cfNotifyEmail $cfNotifyEmail \
+--arg cfS3Endpoint $cfS3Endpoint \
+--arg accessKeyId $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfIamUserAccessKey") | .OutputValue') \
+--arg secretAccessKey $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfIamUserSecretAccessKey") | .OutputValue') \
+--arg buildpacksBucket $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3BuildpacksBucket") | .OutputValue') \
+--arg dropletsBucket $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3DropletsBucket") | .OutputValue') \
+--arg packagesBucket $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3PackagesBucket") | .OutputValue') \
+--arg resourcesBucket $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3ResourcesBucket") | .OutputValue') \
+--arg cfSmtpFrom $cfSmtpFrom \
+--arg cfSmtpAddress $cfSmtpAddress \
+--arg cfSmtpPort $cfSmtpPort \
+--arg cfSmtpUsername $cfSmtpUsername \
+--arg cfSmtpPassword $cfSmtpPassword \
+'{
   properties: {
-    \".cloud_controller.system_domain\": {
-      value: $(echo $systemDomain | jq -R .)
+    ".cloud_controller.system_domain": {
+      value: $systemDomain
     },
-    \".cloud_controller.apps_domain\": {
-      value: $(echo $appsDomain | jq -R .)
+    ".cloud_controller.apps_domain": {
+      value: $appsDomain
     },
-    \".properties.networking_point_of_entry\": {
-      value: \"external_non_ssl\"
+    ".properties.networking_point_of_entry": {
+      value: "external_non_ssl"
     },
-    \".properties.logger_endpoint_port\": {
-      value: \"4443\"
+    ".properties.logger_endpoint_port": {
+      value: "4443"
     },
-    \".properties.security_acknowledgement\": {
-      value: \"X\"
+    ".properties.security_acknowledgement": {
+      value: "X"
     },
-    \".mysql_monitor.recipient_email\": {
-      value: $(echo $cfNotifyEmail | jq -R .)
+    ".mysql_monitor.recipient_email": {
+      value: $cfNotifyEmail
     },
-    \".properties.system_blobstore\": {
-      value: \"external\"
+    ".properties.system_blobstore": {
+      value: "external"
     },
-    \".properties.system_blobstore.external.endpoint\": {
-      value: $(echo $cfS3Endpoint | jq -R .)
+    ".properties.system_blobstore.external.endpoint": {
+      value: $cfS3Endpoint
     },
-    \".properties.system_blobstore.external.access_key\": {
-      value: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfIamUserAccessKey") | .OutputValue' | jq -R .)
+    ".properties.system_blobstore.external.access_key": {
+      value: $accessKeyId
     },
-    \".properties.system_blobstore.external.secret_key\": {
+    ".properties.system_blobstore.external.secret_key": {
       value: {
-        secret: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfIamUserSecretAccessKey") | .OutputValue' | jq -R .)
+        secret: $secretAccessKey
       }
     },
-    \".properties.system_blobstore.external.buildpacks_bucket\": {
-      value: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3BuildpacksBucket") | .OutputValue' | jq -R .)
+    ".properties.system_blobstore.external.buildpacks_bucket": {
+      value: $buildpacksBucket
     },
-    \".properties.system_blobstore.external.droplets_bucket\": {
-      value: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3DropletsBucket") | .OutputValue' | jq -R .)
+    ".properties.system_blobstore.external.droplets_bucket": {
+      value: $dropletsBucket
     },
-    \".properties.system_blobstore.external.packages_bucket\": {
-      value: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3PackagesBucket") | .OutputValue' | jq -R .)
+    ".properties.system_blobstore.external.packages_bucket": {
+      value: $packagesBucket
     },
-    \".properties.system_blobstore.external.resources_bucket\": {
-      value: $(echo $stack | jq -r '.Stacks[0].Outputs[] | select(.OutputKey == "PcfElasticRuntimeS3ResourcesBucket") | .OutputValue' | jq -R .)
+    ".properties.system_blobstore.external.resources_bucket": {
+      value: $resourcesBucket
     },
-    \".properties.smtp_from\": {
-      value: $(echo $cfSmtpFrom | jq -R .)
+    ".properties.smtp_from": {
+      value: $cfSmtpFrom
     },
-    \".properties.smtp_address\": {
-      value: $(echo $cfSmtpAddress | jq -R .)
+    ".properties.smtp_address": {
+      value: $cfSmtpAddress
     },
-    \".properties.smtp_port\": {
-      value: $(echo $cfSmtpPort | jq -R .)
+    ".properties.smtp_port": {
+      value: $cfSmtpPort
     },
-    \".properties.smtp_credentials\": {
+    ".properties.smtp_credentials": {
       value: {
-        identity: $(echo $cfSmtpUsername | jq -R .),
-        password: $(echo $cfSmtpPassword | jq -R .)
+        identity: $cfSmtpUsername,
+        password: $cfSmtpPassword
       }
     },
-    \".properties.smtp_enable_starttls_auto\": {
-      value: \"true\"
+    ".properties.smtp_enable_starttls_auto": {
+      value: "true"
     }
   }
-}")
+}')
 
 curl "https://$opsmanDomain/api/v0/staged/products/$cfGuid/properties" -k \
     -X PUT \
@@ -264,13 +278,16 @@ pendingChanges=$(curl "https://$opsmanDomain/api/v0/staged/pending_changes" -k \
 
 postDeployErrands=$(echo $pendingChanges | jq --arg cfGuid $cfGuid '[.product_changes[] | select (.guid == $cfGuid) | .errands[] | select(.post_deploy == true) | .name]')
 
-errandsData="{
-  \"enabled_errands\": {
-    \"$cfGuid\": {
-      \"post_deploy_errands\": $postDeployErrands
+errandsData=$(jq -n \
+--arg cfGuid "$cfGuid" \
+--argjson postDeployErrands "$postDeployErrands" \
+'{
+  enabled_errands: {
+    ($cfGuid): {
+      post_deploy_errands: $postDeployErrands
     }
   }
-}"
+}')
 
 curl "https://$opsmanDomain/api/v0/installations" -k \
     -X POST \
